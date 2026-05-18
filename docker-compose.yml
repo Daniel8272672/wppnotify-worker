@@ -1,0 +1,11 @@
+version: "3.9"
+services:
+  worker:
+    build: .
+    container_name: wppnotify-worker
+    restart: unless-stopped
+    environment:
+      WPPNOTIFY_URL: ${WPPNOTIFY_URL}
+      WORKER_TOKEN: ${WORKER_TOKEN}
+    volumes:
+      - ./session:/app/session
