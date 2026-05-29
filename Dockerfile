@@ -1,13 +1,9 @@
 FROM node:20-slim
 
-# Dependências do Chromium para puppeteer/whatsapp-web.js
+# Dependências mínimas para o worker Baileys
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    chromium ca-certificates fonts-liberation libnss3 libatk-bridge2.0-0 \
-    libxkbcommon0 libxcomposite1 libxdamage1 libxrandr2 libgbm1 libasound2 \
+    ca-certificates \
   && rm -rf /var/lib/apt/lists/*
-
-ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true \
-    PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 
 WORKDIR /app
 COPY package.json ./
