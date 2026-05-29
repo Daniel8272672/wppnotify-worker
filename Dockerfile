@@ -14,5 +14,4 @@ COPY package.json ./
 RUN npm install --omit=dev
 COPY index.js ./
 
-VOLUME ["/app/session"]
 CMD ["node", "index.js"]
