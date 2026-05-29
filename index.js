@@ -1,11 +1,17 @@
-import pkg from "whatsapp-web.js";
+import makeWASocket, {
+  Browsers,
+  DisconnectReason,
+  fetchLatestBaileysVersion,
+  useMultiFileAuthState,
+} from "@whiskeysockets/baileys";
+import pino from "pino";
 import qrcode from "qrcode-terminal";
-
-const { Client, LocalAuth } = pkg;
 
 const WPPNOTIFY_URL = process.env.WPPNOTIFY_URL;
 const WORKER_TOKEN = process.env.WORKER_TOKEN;
-const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || "10000", 10);
+const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || "30000", 10);
+const SESSION_DIR = process.env.SESSION_DIR || "./session";
+const LOG_LEVEL = process.env.LOG_LEVEL || "warn";
 
 if (!WPPNOTIFY_URL || !WORKER_TOKEN) {
   console.error("Defina WPPNOTIFY_URL e WORKER_TOKEN");
@@ -18,18 +24,44 @@ const WORKER_CONTACTS_URL =
   process.env.WORKER_CONTACTS_URL || WPPNOTIFY_URL.replace(/\/ingest\/?$/, "/worker-contacts");
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const logger = pino({ level: LOG_LEVEL });
 
-function toJid(phoneNumber) {
-  const clean = String(phoneNumber || "").replace(/\D/g, "");
-  return clean ? `${clean}@c.us` : null;
+let sock = null;
+let reconnecting = false;
+let refreshRunning = false;
+let connected = false;
+let monitoredJids = [];
+let monitoredPhonesByJid = new Map();
+const lastStatus = new Map();
+
+function toPhone(value) {
+  return String(value || "").replace(/\D/g, "");
 }
 
-function statusFromPresence({ state, isOnline }) {
-  const normalized = String(state || "").toLowerCase();
-  if (normalized === "composing") return "typing";
-  if (normalized === "recording") return "recording";
-  if (isOnline === true || normalized === "available") return "online";
-  if (isOnline === false || normalized === "unavailable" || normalized === "offline") return "offline";
+function toJid(phoneNumber) {
+  const phone = toPhone(phoneNumber);
+  return phone ? `${phone}@s.whatsapp.net` : null;
+}
+
+function normalizeJid(jid) {
+  const value = String(jid || "");
+  if (!value) return null;
+  if (value.includes("@s.whatsapp.net")) return value;
+  if (value.includes("@c.us")) return value.replace("@c.us", "@s.whatsapp.net");
+  const phone = toPhone(value.split("@")[0]);
+  return phone ? `${phone}@s.whatsapp.net` : null;
+}
+
+function jidToPhone(jid) {
+  return toPhone(String(jid || "").split("@")[0]);
+}
+
+function statusFromPresence(presence) {
+  const state = String(presence?.lastKnownPresence || presence?.type || "").toLowerCase();
+  if (state === "composing") return "typing";
+  if (state === "recording") return "recording";
+  if (state === "available" || state === "paused") return "online";
+  if (state === "unavailable") return "offline";
   return null;
 }
 
@@ -52,25 +84,35 @@ async function fetchMonitoredContacts() {
     headers: { "x-worker-token": WORKER_TOKEN },
   });
   if (!res.ok) throw new Error(`worker-contacts failed ${res.status}: ${await res.text()}`);
+
   const data = await res.json();
-  return (data.contacts || []).map((c) => toJid(c.phone_number)).filter(Boolean);
+  const rows = Array.isArray(data.contacts) ? data.contacts : [];
+  const nextPhonesByJid = new Map();
+  const nextJids = [];
+
+  for (const row of rows) {
+    const phone = toPhone(row.phone_number);
+    const jid = toJid(phone);
+    if (!jid) continue;
+    nextJids.push(jid);
+    nextPhonesByJid.set(jid, phone);
+  }
+
+  monitoredPhonesByJid = nextPhonesByJid;
+  return [...new Set(nextJids)];
 }
-
-const client = new Client({
-  authStrategy: new LocalAuth({ dataPath: "./session" }),
-  puppeteer: { args: ["--no-sandbox", "--disable-setuid-sandbox"] },
-});
-
-const lastStatus = new Map();
-let monitoredJids = [];
-let presenceFunctionExposed = false;
 
 async function ingest(phone_number, status, extra = {}) {
   try {
     const res = await fetch(WPPNOTIFY_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-worker-token": WORKER_TOKEN },
-      body: JSON.stringify({ phone_number, status, occurred_at: new Date().toISOString(), ...extra }),
+      body: JSON.stringify({
+        phone_number,
+        status,
+        occurred_at: new Date().toISOString(),
+        ...extra,
+      }),
     });
     if (!res.ok) console.error("ingest failed", res.status, await res.text());
   } catch (e) {
@@ -78,192 +120,162 @@ async function ingest(phone_number, status, extra = {}) {
   }
 }
 
-async function handlePresence({ jid, state, isOnline, source = "presence" }) {
-  if (!jid) return;
-  const status = statusFromPresence({ state, isOnline });
+async function handlePresence(jidLike, presence, source = "presence.update") {
+  const jid = normalizeJid(jidLike);
+  if (!jid || !monitoredPhonesByJid.has(jid)) return;
+
+  const status = statusFromPresence(presence);
   if (!status) return;
   if (lastStatus.get(jid) === status) return;
 
-  const phone = String(jid).split("@")[0];
+  const phone = monitoredPhonesByJid.get(jid) || jidToPhone(jid);
   const isFirstOffline = !lastStatus.has(jid) && status === "offline";
   lastStatus.set(jid, status);
-  console.log(`[${new Date().toISOString()}] ${phone} → ${status} (${source})`);
-  if (!isFirstOffline) await ingest(phone, status, { metadata: { source, state, isOnline } });
-}
 
-async function exposePresenceFunction() {
-  if (presenceFunctionExposed || !client.pupPage) return;
-  try {
-    await client.pupPage.exposeFunction("__wppnotifyPresenceEvent", (payload) => {
-      handlePresence({ ...payload, source: "event" }).catch((e) =>
-        console.error("presence event error", e.message)
-      );
+  console.log(`[${new Date().toISOString()}] ${phone} → ${status} (${source})`);
+  if (!isFirstOffline) {
+    await ingest(phone, status, {
+      metadata: {
+        source,
+        lastKnownPresence: presence?.lastKnownPresence || null,
+        lastSeen: presence?.lastSeen || null,
+      },
     });
-    presenceFunctionExposed = true;
-  } catch (e) {
-    if (String(e.message || "").includes("already exists")) presenceFunctionExposed = true;
-    else console.error("exposeFunction error", e.message);
   }
 }
 
-async function subscribeJids(jids) {
-  if (!jids.length || !client.pupPage) return;
-  const results = await client.pupPage.evaluate(async (ids) => {
-    const Store = window.Store;
-    if (!Store || !Store.Presence || !Store.WidFactory) {
-      return ids.map((j) => `${j}:no-store`);
-    }
+async function subscribeAll(reason = "refresh") {
+  if (!sock || !connected || refreshRunning) return;
+  refreshRunning = true;
 
-    const serialize = (wid) => wid?._serialized || (wid?.toString ? wid.toString() : String(wid || ""));
-
-    const emit = (presence) => {
-      try {
-        if (!presence) return;
-        const jid = serialize(presence.id);
-        if (!jid.includes("@c.us")) return;
-        const chatstate =
-          presence.chatstate?.type ||
-          presence.chatstate?.attributes?.type ||
-          (presence.isOnline ? "available" : "unavailable");
-        window.__wppnotifyPresenceEvent?.({
-          jid,
-          state: chatstate,
-          isOnline: Boolean(presence.isOnline),
-        });
-      } catch (e) {}
-    };
-
-    const out = [];
-    for (const jid of ids) {
-      try {
-        const wid = Store.WidFactory.createWid(jid);
-        const serialized = serialize(wid) || jid;
-
-        let presence = Store.Presence.get(serialized);
-        if (!presence && Store.Presence.find) {
-          presence = await Store.Presence.find(wid).catch(() => null);
-        }
-        if (!presence) {
-          out.push(`${jid}:nopresence`);
-          continue;
-        }
-
-        if (typeof presence.subscribe === "function") {
-          await presence.subscribe().catch(() => {});
-        } else if (Store.PresenceUtils?.sendPresenceSubscription) {
-          await Store.PresenceUtils.sendPresenceSubscription(wid).catch(() => {});
-        }
-
-        if (!presence.__wppnotifyHooked && typeof presence.on === "function") {
-          presence.__wppnotifyHooked = true;
-          presence.on("change:isOnline", () => emit(presence));
-          presence.on("change:chatstate", () => emit(presence));
-          presence.on("change", () => emit(presence));
-        }
-
-        out.push(jid);
-      } catch (e) {
-        out.push(`${jid}:${String(e.message || "erro").slice(0, 40)}`);
-      }
-    }
-    return out;
-  }, jids);
-
-  const ok = results.filter((r) => !r.includes(":")).length;
-  const failed = results.filter((r) => r.includes(":"));
-  console.log(`Presença assinada para ${ok}/${jids.length} contatos monitorados.`);
-  if (failed.length) console.log("  falhas:", failed.join(", "));
-}
-
-async function refreshSubscriptions() {
   try {
     monitoredJids = await fetchMonitoredContacts();
-    await exposePresenceFunction();
-    await subscribeJids(monitoredJids);
-  } catch (e) {
-    console.error("refreshSubscriptions error", e.message);
-  }
-}
 
-async function pollPresence() {
-  if (!monitoredJids.length || !client.pupPage) return;
-  try {
-    const statuses = await client.pupPage.evaluate((ids) => {
-      const Store = window.Store;
-      if (!Store || !Store.Presence || !Store.WidFactory) return [];
-      const serialize = (wid) => wid?._serialized || String(wid || "");
-      return ids.map((jid) => {
-        const wid = Store.WidFactory.createWid(jid);
-        const presence = Store.Presence.get(serialize(wid)) || Store.Presence.get(jid);
-        const chatstate =
-          presence?.chatstate?.type ||
-          presence?.chatstate?.attributes?.type ||
-          (presence?.isOnline ? "available" : "unavailable");
-        return {
-          jid,
-          state: chatstate,
-          isOnline: Boolean(presence?.isOnline),
-          hasPresence: Boolean(presence),
-        };
-      });
-    }, monitoredJids);
-
-    for (const item of statuses) {
-      if (!item.hasPresence) continue;
-      await handlePresence({ ...item, source: "poll" });
+    if (!monitoredJids.length) {
+      console.log("Nenhum contato com monitoramento ativo foi retornado pelo app.");
+      return;
     }
+
+    console.log(
+      `Monitorando ${monitoredJids.length} contato(s): ${monitoredJids
+        .map((jid) => monitoredPhonesByJid.get(jid) || jidToPhone(jid))
+        .join(", ")}`
+    );
+
+    let ok = 0;
+    const failures = [];
+    for (const jid of monitoredJids) {
+      try {
+        await sock.presenceSubscribe(jid);
+        ok += 1;
+        await sleep(250);
+      } catch (e) {
+        failures.push(`${monitoredPhonesByJid.get(jid) || jidToPhone(jid)}:${e.message}`);
+      }
+    }
+
+    console.log(`Presença assinada para ${ok}/${monitoredJids.length} contatos monitorados (${reason}).`);
+    if (failures.length) console.log("  falhas:", failures.join(", "));
   } catch (e) {
-    console.error("pollPresence error", e.message);
+    console.error("subscribeAll error", e.message);
+  } finally {
+    refreshRunning = false;
   }
 }
 
-client.on("qr", (qr) => {
-  console.log("\n📱 Escaneie o QR Code no WhatsApp:\n");
-  qrcode.generate(qr, { small: true });
-  console.log("\n➡️  Ou abra Configurações no app WppNotify para escanear o QR Code direto na tela.\n");
-  reportStatus("qr", qr);
-});
+async function startWorker() {
+  const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
+  let version;
+  try {
+    ({ version } = await fetchLatestBaileysVersion());
+  } catch (e) {
+    console.error("Não consegui buscar a versão mais recente do WhatsApp Web; usando padrão da biblioteca.", e.message);
+  }
 
-client.on("ready", async () => {
-  console.log("✅ Worker conectado ao WhatsApp");
-  reportStatus("connected");
-  await sleep(2000);
-  await refreshSubscriptions();
-});
-
-client.on("authenticated", () => {
-  console.log("🔐 Autenticado");
-  reportStatus("connecting");
-});
-
-client.on("auth_failure", (msg) => {
-  console.error("❌ Falha de autenticação:", msg);
-  reportStatus("disconnected");
-});
-
-client.on("disconnected", (reason) => {
-  console.error("🔌 Desconectado:", reason);
-  reportStatus("disconnected");
-  presenceFunctionExposed = false;
-});
-
-client.on("presence_update", async ({ id, presences }) => {
-  if (!id) return;
-  const jid = id._serialized || id;
-  const list = Array.isArray(presences) ? presences : [];
-  const me = list.find?.((p) => (p.id?._serialized || p.id) === jid) ?? list[0];
-  await handlePresence({
-    jid,
-    state: me?.chatstate?.type,
-    isOnline: me?.isOnline ?? (me?.lastSeen === null ? true : undefined),
-    source: "native-event",
+  sock = makeWASocket({
+    auth: state,
+    browser: Browsers.ubuntu("WppNotify"),
+    logger,
+    markOnlineOnConnect: false,
+    printQRInTerminal: false,
+    syncFullHistory: false,
+    ...(version ? { version } : {}),
   });
-});
 
-setInterval(async () => {
-  await refreshSubscriptions();
-  await sleep(1500);
-  await pollPresence();
+  sock.ev.on("creds.update", saveCreds);
+
+  sock.ev.on("connection.update", async (update) => {
+    const { connection, lastDisconnect, qr } = update;
+
+    if (qr) {
+      console.log("\n📱 Escaneie o QR Code no WhatsApp:\n");
+      qrcode.generate(qr, { small: true });
+      console.log("\n➡️  Ou abra Configurações no app WppNotify para escanear direto na tela.\n");
+      await reportStatus("qr", qr);
+    }
+
+    if (connection === "connecting") {
+      console.log("🔐 Autenticando/conectando ao WhatsApp...");
+      await reportStatus("connecting");
+    }
+
+    if (connection === "open") {
+      connected = true;
+      reconnecting = false;
+      console.log("✅ Worker conectado ao WhatsApp");
+      await reportStatus("connected");
+      await sleep(1500);
+      await subscribeAll("connect");
+    }
+
+    if (connection === "close") {
+      connected = false;
+      const statusCode = lastDisconnect?.error?.output?.statusCode;
+      const message = lastDisconnect?.error?.message || "conexão fechada";
+      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+
+      console.error(`🔌 Desconectado: ${message} (status ${statusCode || "sem código"})`);
+      await reportStatus("disconnected");
+
+      if (!shouldReconnect) {
+        console.error("Sessão encerrada pelo WhatsApp. Apague a pasta session no Railway e escaneie um QR novo.");
+        return;
+      }
+
+      if (!reconnecting) {
+        reconnecting = true;
+        console.log("Tentando reconectar em 5 segundos...");
+        setTimeout(() => startWorker().catch((e) => console.error("reconnect error", e.message)), 5000);
+      }
+    }
+  });
+
+  sock.ev.on("presence.update", async ({ id, presences }) => {
+    const entries = Object.entries(presences || {});
+    if (!entries.length) return;
+
+    for (const [participantJid, presence] of entries) {
+      await handlePresence(participantJid || id, presence, "presence.update");
+    }
+  });
+}
+
+setInterval(() => {
+  subscribeAll("interval").catch((e) => console.error("interval subscribe error", e.message));
 }, POLL_INTERVAL_MS);
 
-client.initialize();
+process.on("unhandledRejection", (reason) => {
+  console.error("unhandledRejection", reason);
+});
+
+process.on("uncaughtException", (error) => {
+  console.error("uncaughtException", error);
+});
+
+console.log("Iniciando WppNotify worker com Baileys...");
+console.log(`App endpoint: ${WPPNOTIFY_URL}`);
+console.log(`Contacts endpoint: ${WORKER_CONTACTS_URL}`);
+startWorker().catch((e) => {
+  console.error("Erro fatal ao iniciar worker", e);
+  process.exit(1);
+});
