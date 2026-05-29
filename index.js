@@ -12,6 +12,23 @@ if (!WPPNOTIFY_URL || !WORKER_TOKEN) {
   process.exit(1);
 }
 
+// URL do endpoint de status/QR (derivada do endpoint de ingestão).
+const WORKER_QR_URL =
+  process.env.WORKER_QR_URL || WPPNOTIFY_URL.replace(/\/ingest\/?$/, "/worker-qr");
+
+async function reportStatus(status, qr = null) {
+  try {
+    const res = await fetch(WORKER_QR_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-worker-token": WORKER_TOKEN },
+      body: JSON.stringify({ status, qr }),
+    });
+    if (!res.ok) console.error("reportStatus failed", res.status, await res.text());
+  } catch (e) {
+    console.error("reportStatus error", e.message);
+  }
+}
+
 const client = new Client({
   authStrategy: new LocalAuth({ dataPath: "./session" }),
   puppeteer: { args: ["--no-sandbox", "--disable-setuid-sandbox"] },
@@ -33,10 +50,13 @@ async function ingest(phone_number, status, extra = {}) {
 client.on("qr", (qr) => {
   console.log("\n📱 Escaneie o QR Code no WhatsApp:\n");
   qrcode.generate(qr, { small: true });
+  console.log("\n➡️  Ou abra Configurações no app WppNotify para escanear o QR Code direto na tela.\n");
+  reportStatus("qr", qr);
 });
 
 client.on("ready", async () => {
   console.log("✅ Worker conectado ao WhatsApp");
+  reportStatus("connected");
   const contacts = await client.getContacts();
   console.log(`Inscrevendo presença de ${contacts.length} contatos...`);
   for (const c of contacts) {
@@ -44,6 +64,21 @@ client.on("ready", async () => {
       try { await client.subscribeToPresence?.(c.id._serialized); } catch {}
     }
   }
+});
+
+client.on("authenticated", () => {
+  console.log("🔐 Autenticado");
+  reportStatus("connecting");
+});
+
+client.on("auth_failure", (msg) => {
+  console.error("❌ Falha de autenticação:", msg);
+  reportStatus("disconnected");
+});
+
+client.on("disconnected", (reason) => {
+  console.error("🔌 Desconectado:", reason);
+  reportStatus("disconnected");
 });
 
 client.on("presence_update", async ({ id, presences }) => {
