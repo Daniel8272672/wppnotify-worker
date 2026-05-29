@@ -1,11 +1,20 @@
-import makeWASocket, {
-  Browsers,
-  DisconnectReason,
-  fetchLatestBaileysVersion,
-  useMultiFileAuthState,
-} from "@whiskeysockets/baileys";
-import pino from "pino";
-import qrcode from "qrcode-terminal";
+import { execFileSync } from "node:child_process";
+import { createRequire } from "node:module";
+
+const require = createRequire(import.meta.url);
+const REQUIRED_PACKAGES = [
+  ["@whiskeysockets/baileys", "7.0.0-rc13"],
+  ["pino", "10.3.1"],
+  ["qrcode-terminal", "0.12.0"],
+];
+
+let makeWASocket;
+let Browsers;
+let DisconnectReason;
+let fetchLatestBaileysVersion;
+let useMultiFileAuthState;
+let qrcode;
+let logger;
 
 const WPPNOTIFY_URL = process.env.WPPNOTIFY_URL;
 const WORKER_TOKEN = process.env.WORKER_TOKEN;
@@ -24,7 +33,38 @@ const WORKER_CONTACTS_URL =
   process.env.WORKER_CONTACTS_URL || WPPNOTIFY_URL.replace(/\/ingest\/?$/, "/worker-contacts");
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-const logger = pino({ level: LOG_LEVEL });
+
+async function ensureDependencies() {
+  const missing = REQUIRED_PACKAGES.filter(([name]) => {
+    try {
+      require.resolve(name);
+      return false;
+    } catch {
+      return true;
+    }
+  });
+
+  if (missing.length) {
+    console.log(`Instalando dependências ausentes do worker: ${missing.map(([name]) => name).join(", ")}`);
+    execFileSync(
+      "npm",
+      ["install", "--omit=dev", "--no-save", ...missing.map(([name, version]) => `${name}@${version}`)],
+      { stdio: "inherit" }
+    );
+  }
+
+  const baileys = await import("@whiskeysockets/baileys");
+  const pinoModule = await import("pino");
+  const qrcodeModule = await import("qrcode-terminal");
+
+  makeWASocket = baileys.default;
+  Browsers = baileys.Browsers;
+  DisconnectReason = baileys.DisconnectReason;
+  fetchLatestBaileysVersion = baileys.fetchLatestBaileysVersion;
+  useMultiFileAuthState = baileys.useMultiFileAuthState;
+  qrcode = qrcodeModule.default || qrcodeModule;
+  logger = (pinoModule.default || pinoModule)({ level: LOG_LEVEL });
+}
 
 let sock = null;
 let reconnecting = false;
@@ -275,7 +315,7 @@ process.on("uncaughtException", (error) => {
 console.log("Iniciando WppNotify worker com Baileys...");
 console.log(`App endpoint: ${WPPNOTIFY_URL}`);
 console.log(`Contacts endpoint: ${WORKER_CONTACTS_URL}`);
-startWorker().catch((e) => {
+ensureDependencies().then(startWorker).catch((e) => {
   console.error("Erro fatal ao iniciar worker", e);
   process.exit(1);
 });
